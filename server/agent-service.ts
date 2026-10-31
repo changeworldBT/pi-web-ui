@@ -428,6 +428,16 @@ const DESKTOP_WIRE = desktopDirWire(HOME_WIRE);
 const STREAMING_SNAPSHOT_INTERVAL_MS = 2000;
 /** Deltas newer than this keep the streaming (low-frequency) snapshot cadence. */
 const DELTA_ACTIVE_WINDOW_MS = 1500;
+/** 切换会话的「快照抑制窗口」：switchSession / switchConversation 尾部已经同步发过
+ *  一份权威全量快照，但 bindSession 里的 scheduleSnapshot 是个 60ms 定时器，会在
+ *  <100ms 后再补发一份内容完全相同的全量快照 —— 每次切换白多序列化一遍整段对话
+ *  （窗口化后仍要走 identity walk + 组包 + WS deflate）。尾部快照之后开这个窗口，
+ *  窗口内**非 force** 的快照一律静默丢弃；force（切换尾部那份 / get_state 全量重
+ *  同步）不受限制。只拦快照，不碰 message_delta / snapshot_delta 流式增量。
+ *  Suppression window opened right after a switch's authoritative snapshot: the
+ *  60ms scheduleSnapshot timer fired by bindSession would push an identical full
+ *  snapshot <100ms later. Non-forced snapshots inside the window are dropped. */
+const SWITCH_SNAPSHOT_SUPPRESS_MS = 250;
 /**
  * `session.getSessionStats()` 会遍历整份转写，而 `message_delta` 曾经**每一帧**都调它
  * （只为了填 usage）。实测 6000 条转写 × 6002 帧时这一条链占了流式阶段 **27.6%** 的 CPU
@@ -889,6 +899,13 @@ export interface TakeoverPayload {
 }
 
 import { processTreeKillPlan, resolveCwdTarget } from "./process-utils.js";
+/** 抑制窗口判定（纯函数，单测见 tests/unit/switch-snapshot-suppress.test.ts）。
+ *  force（切换尾部快照 / get_state 全量重同步）永远放行，其余只在窗口到期后放行。
+ *  Pure gate for the switch suppression window — forced snapshots always pass. */
+export function shouldEmitSnapshot(now: number, suppressUntil: number, force: boolean): boolean {
+	return force || now >= suppressUntil;
+}
+
 /**
  * 清扫异常退出/崩溃后遗留的孤儿临时会话目录（subagent-sessions / ephemeral-sessions）。
  * 默认清理超过 TTL（24h）的临时目录，避免无上限累积。
@@ -3272,6 +3289,11 @@ export class ClientSession {
 	private sinks = new Set<(msg: ServerMessage) => void>();
 	private pendingNotices: ServerMessage[] = [];
 	private snapshotTimer: ReturnType<typeof setTimeout> | null = null;
+	/** 快照抑制窗口的截止时刻（见 SWITCH_SNAPSHOT_SUPPRESS_MS）：此时间之前的非 force
+	 *  快照一律静默丢弃 —— 切换尾部那份权威快照之后，bindSession 的 60ms 定时器补发
+	 *  是纯冗余。默认 0 = 永不抑制（非切换时刻不生效）。
+	 *  Non-forced snapshots before this timestamp are dropped (switch dedupe only). */
+	private suppressSnapshotUntil = 0;
 	/** Timestamp of the most recent message_delta push — while fresh, snapshots
 	 *  use the slower STREAMING_SNAPSHOT_INTERVAL_MS cadence. */
 	private lastDeltaAt = 0;
@@ -6460,6 +6482,10 @@ export class ClientSession {
 				.catch(() => {});
 			return;
 		}
+		// 切换会话的抑制窗口：尾部权威快照之后 250ms 内的非 force 快照（bindSession
+		// 的 60ms 定时器补发）直接丢弃 → 每次切换只发 1 份全量快照。
+		// force（切换尾部 / get_state 全量重同步）不受窗口限制。
+		if (!shouldEmitSnapshot(Date.now(), this.suppressSnapshotUntil, forceFull)) return;
 		this.emitQuestionQueue();
 		const cur = this.currentMessages();
 		const prev = this.emittedMessages;
@@ -13132,7 +13158,10 @@ export class ClientSession {
 
 		// 核心：快照与完成信号优先！在繁重的工作区扫描/设置推送之前第一时间发往
 		// 浏览器，0ms 呈现对话内容与状态，绝不让前端在空转中等待文件树与设置大包。
-		this.flushSnapshot();
+		// 这一份就是本次切换的权威快照（force）：随后 250ms 内任何非 force 的补发
+		// （bindSession 的 60ms 定时器）都会被抑制窗口丢弃，切换只发 1 份。
+		this.suppressSnapshotUntil = Date.now() + SWITCH_SNAPSHOT_SUPPRESS_MS;
+		this.flushSnapshot(true);
 		this.emit({
 			type: "transition_progress",
 			kind: "conversation",
@@ -13156,6 +13185,8 @@ export class ClientSession {
 						if (this.disposed || this.activeId !== convId || this.cwd !== newCwd) return;
 						await this.restoreProjectModelForCwd(newCwd);
 						if (this.disposed || this.activeId !== convId || this.cwd !== newCwd) return;
+						// 模型栏回填是显式请求，不该被上面的切换抑制窗口吞掉
+						this.suppressSnapshotUntil = 0;
 						this.flushSnapshot();
 					} catch {
 						/* 静默：恢复失败保持会话默认 */
@@ -14638,6 +14669,8 @@ export class ClientSession {
 						if (this.disposed || this.activeId !== convId || this.cwd !== targetCwd) return;
 						await this.restoreProjectModelForCwd(targetCwd);
 						if (this.disposed || this.activeId !== convId || this.cwd !== targetCwd) return;
+						// 模型栏回填是显式请求，不该被上面的切换抑制窗口吞掉
+						this.suppressSnapshotUntil = 0;
 						this.flushSnapshot();
 					} catch {
 						/* 静默：恢复失败保持会话默认 */
@@ -14665,7 +14698,10 @@ export class ClientSession {
 			});
 			outcome = "loaded";
 			timing.mark("workspace-and-settings");
-			this.flushSnapshot();
+			// 本次切换的权威快照（force）：bindSession 里 60ms 定时器的补发会被随后
+			// 的抑制窗口拦掉 —— 切一次只发 1 份全量快照。
+			this.suppressSnapshotUntil = Date.now() + SWITCH_SNAPSHOT_SUPPRESS_MS;
+			this.flushSnapshot(true);
 			timing.mark("snapshot-send");
 		} catch (err) {
 			outcome = "error";
